@@ -15,9 +15,14 @@ class IngestReport:
     documents: int = 0
     pages: int = 0
     chunks_indexed: int = 0
+    chunks_skipped: int = 0
     total_chunks: int = 0
     load_failures: list[LoaderError] = field(default_factory=list)
     store_failures: list[VectorStoreError] = field(default_factory=list)
+    space: str = ""
+    collection: str = ""
+    fallback_used: bool = False
+    space_reason: str = ""
 
     @property
     def ok(self) -> bool:
@@ -49,6 +54,7 @@ def index_directory(
     store: VectorStore,
     chunker: Chunker | None = None,
     batch_size: int = DEFAULT_STORE_BATCH_SIZE,
+    skip_existing: bool = False,
 ) -> IngestReport:
     chunker = chunker or RecursiveChunker()
 
@@ -60,10 +66,19 @@ def index_directory(
         load_failures=load_failures,
     )
 
+    stored = store.existing_ids() if skip_existing else set()
+
+    if stored:
+        report.chunks_skipped = len(stored)
+
     pending: list = []
 
     for page in pages:
-        pending.extend(chunker.chunk(page))
+        for chunk in chunker.chunk(page):
+            if chunk.chunk_id in stored:
+                continue
+
+            pending.append(chunk)
 
         if len(pending) >= batch_size:
             _flush(pending, store, report)

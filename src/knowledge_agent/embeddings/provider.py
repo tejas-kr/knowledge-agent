@@ -7,6 +7,7 @@ from itertools import batched
 from google import genai
 
 from knowledge_agent.config import GEMINI_API_KEY, GEMINI_EMBEDDING_MODEL
+from knowledge_agent.embeddings.space import GEMINI_DIMENSIONS, EmbeddingSpace, space_for
 
 DEFAULT_EMBEDDING_MODEL = "gemini-embedding-001"
 MAX_BATCH_SIZE = 100
@@ -35,6 +36,11 @@ class EmbeddingQuotaError(EmbeddingAPIError):
 
 
 class EmbeddingProvider(ABC):
+    @property
+    @abstractmethod
+    def space(self) -> EmbeddingSpace:
+        raise NotImplementedError
+
     @abstractmethod
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
         raise NotImplementedError
@@ -42,6 +48,32 @@ class EmbeddingProvider(ABC):
     @abstractmethod
     def embed_query(self, text: str) -> list[float]:
         raise NotImplementedError
+
+
+def validate_vectors(
+    texts: Sequence[str],
+    vectors: list[list[float]],
+    model: str,
+) -> None:
+    if len(vectors) != len(texts):
+        raise EmbeddingError(
+            f"Expected {len(texts)} embeddings from '{model}', got {len(vectors)}"
+        )
+
+    if not vectors:
+        return
+
+    expected = len(vectors[0])
+
+    if expected == 0:
+        raise EmbeddingError(f"'{model}' returned an empty embedding")
+
+    for vector in vectors:
+        if len(vector) != expected:
+            raise EmbeddingError(
+                f"Inconsistent embedding size from '{model}': "
+                f"expected {expected}, got {len(vector)}"
+            )
 
 
 class GeminiEmbeddingProvider(EmbeddingProvider):
@@ -96,6 +128,14 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
             )
 
         self._client = genai.Client(api_key=resolved_key)
+
+    @property
+    def space(self) -> EmbeddingSpace:
+        return space_for(
+            self.model,
+            self.output_dimensionality or GEMINI_DIMENSIONS,
+            "gemini",
+        )
 
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
         return self._embed(list(texts), DOCUMENT_TASK_TYPE)
@@ -183,22 +223,4 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
         )
 
     def _validate(self, texts: list[str], vectors: list[list[float]]) -> None:
-        if len(vectors) != len(texts):
-            raise EmbeddingError(
-                f"Expected {len(texts)} embeddings from '{self.model}', got {len(vectors)}"
-            )
-
-        if not vectors:
-            return
-
-        expected = len(vectors[0])
-
-        if expected == 0:
-            raise EmbeddingError(f"'{self.model}' returned an empty embedding")
-
-        for vector in vectors:
-            if len(vector) != expected:
-                raise EmbeddingError(
-                    f"Inconsistent embedding size from '{self.model}': "
-                    f"expected {expected}, got {len(vector)}"
-                )
+        validate_vectors(texts, vectors, self.model)

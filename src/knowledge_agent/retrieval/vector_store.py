@@ -5,7 +5,8 @@ from pathlib import Path
 import chromadb
 
 from knowledge_agent.config import CHROMA_DIR
-from knowledge_agent.embeddings.provider import EmbeddingProvider
+from knowledge_agent.embeddings.provider import EmbeddingError, EmbeddingProvider
+from knowledge_agent.embeddings.space import LEGACY_COLLECTIONS, EmbeddingSpace
 from knowledge_agent.schemas.chunk import Chunk
 from knowledge_agent.schemas.retrieval import SearchResult
 
@@ -13,6 +14,7 @@ DEFAULT_COLLECTION_NAME = "knowledge"
 DEFAULT_TOP_K = 5
 SPACE_KEY = "hnsw:space"
 COSINE_SPACE = "cosine"
+EMBEDDING_SPACE_KEY = "embedding_space"
 
 
 class VectorStoreError(Exception):
@@ -45,21 +47,36 @@ class VectorStore(ABC):
     def count(self) -> int:
         raise NotImplementedError
 
+    @abstractmethod
+    def existing_ids(self) -> set[str]:
+        raise NotImplementedError
+
 
 class ChromaVectorStore(VectorStore):
     def __init__(
         self,
-        provider: EmbeddingProvider,
+        provider: EmbeddingProvider | None = None,
         directory: Path | None = None,
-        collection_name: str = DEFAULT_COLLECTION_NAME,
+        collection_name: str | None = None,
+        space: EmbeddingSpace | None = None,
         client=None,
     ) -> None:
-        if not collection_name.strip():
+        resolved_space = space or (provider.space if provider is not None else None)
+
+        if resolved_space is None:
+            raise VectorStoreError(
+                "A provider or space is required to select a collection"
+            )
+
+        resolved_name = collection_name or resolved_space.collection
+
+        if not resolved_name.strip():
             raise VectorStoreError("collection_name cannot be empty")
 
         self.provider = provider
+        self.space = resolved_space
         self.directory = Path(directory) if directory is not None else CHROMA_DIR
-        self.collection_name = collection_name
+        self.collection_name = resolved_name
 
         self._client = (
             client
@@ -67,13 +84,66 @@ class ChromaVectorStore(VectorStore):
             else chromadb.PersistentClient(path=str(self.directory))
         )
         self._collection = self._client.get_or_create_collection(
-            name=collection_name,
-            metadata={SPACE_KEY: COSINE_SPACE},
+            name=resolved_name,
+            metadata={
+                SPACE_KEY: COSINE_SPACE,
+                EMBEDDING_SPACE_KEY: resolved_space.key,
+            },
         )
 
-    @staticmethod
-    def chunk_id(chunk: Chunk) -> str:
-        return f"{chunk.document_id}:{chunk.page_number}:{chunk.chunk_index}"
+        self._verify_space()
+
+    def _verify_space(self) -> None:
+        """Refuse to mix vectors from different models in one collection.
+
+        Compares the recorded ``embedding_space`` identity, never the width:
+        both spaces emit 3072-dim vectors, so a dimension check would pass
+        while the index silently became meaningless.
+        """
+        metadata = getattr(self._collection, "metadata", None) or {}
+        recorded = metadata.get(EMBEDDING_SPACE_KEY)
+
+        if recorded is None:
+            self._verify_legacy_space()
+            return
+
+        if recorded == self.space.key:
+            return
+
+        raise VectorStoreError(
+            f"Collection '{self.collection_name}' holds '{recorded}' embeddings but "
+            f"'{self.space.model}' produces '{self.space.key}'. Vectors from different "
+            f"embedding models cannot share an index. Re-run with --space {recorded}, "
+            f"or index into a different collection."
+        )
+
+    def _verify_legacy_space(self) -> None:
+        """Guard a collection created before ``embedding_space`` existed.
+
+        Such a collection records only its width, and width cannot tell two
+        3072-dim models apart, so ownership is checked against the space that
+        is known to have created it.
+        """
+        owner = LEGACY_COLLECTIONS.get(self.collection_name)
+
+        if owner is None or owner.key == self.space.key:
+            return
+
+        raise VectorStoreError(
+            f"Collection '{self.collection_name}' was created by '{owner.model}' "
+            f"({owner.key}) and records no embedding_space metadata, but "
+            f"'{self.space.model}' produces '{self.space.key}'. Vectors from different "
+            f"embedding models cannot share an index. Re-run with --space {owner.key}, "
+            f"or index into a different collection."
+        )
+
+    def _require_provider(self) -> EmbeddingProvider:
+        if self.provider is None:
+            raise VectorStoreError(
+                f"No embedding provider configured for '{self.collection_name}'"
+            )
+
+        return self.provider
 
     def add_chunks(
         self,
@@ -86,7 +156,14 @@ class ChromaVectorStore(VectorStore):
             return []
 
         if embeddings is None:
-            vectors = self.provider.embed_documents([c.content for c in items])
+            try:
+                vectors = self._require_provider().embed_documents(
+                    [c.content for c in items]
+                )
+            except EmbeddingError as exc:
+                raise VectorStoreError(
+                    f"Failed to embed {len(items)} chunks: {exc}"
+                ) from exc
         else:
             vectors = [list(vector) for vector in embeddings]
 
@@ -95,7 +172,7 @@ class ChromaVectorStore(VectorStore):
                     f"Expected {len(items)} embeddings, got {len(vectors)}"
                 )
 
-        ids = [self.chunk_id(c) for c in items]
+        ids = [c.chunk_id for c in items]
 
         try:
             self._collection.upsert(
@@ -126,7 +203,10 @@ class ChromaVectorStore(VectorStore):
         if self.count() == 0:
             return []
 
-        vector = self.provider.embed_query(query)
+        try:
+            vector = self._require_provider().embed_query(query)
+        except EmbeddingError as exc:
+            raise VectorStoreError(f"Failed to embed query: {exc}") from exc
 
         try:
             response = self._collection.query(
@@ -159,6 +239,16 @@ class ChromaVectorStore(VectorStore):
             raise VectorStoreError(
                 f"Failed to count chunks in '{self.collection_name}': {exc}"
             ) from exc
+
+    def existing_ids(self) -> set[str]:
+        try:
+            response = self._collection.get(include=[])
+        except Exception as exc:
+            raise VectorStoreError(
+                f"Failed to read stored ids in '{self.collection_name}': {exc}"
+            ) from exc
+
+        return set(response.get("ids") or [])
 
     def _metadata(self, chunk: Chunk) -> dict:
         return {

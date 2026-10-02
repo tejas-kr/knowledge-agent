@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from knowledge_agent.embeddings.provider import EmbeddingProvider
+from knowledge_agent.embeddings.space import GEMINI_SPACE
 from knowledge_agent.ingestion.chunker import RecursiveChunker
 from knowledge_agent.ingestion.pipeline import index_directory
 from knowledge_agent.retrieval.vector_store import ChromaVectorStore
@@ -18,6 +19,10 @@ VOCABULARY = "abcdefghijklmnopqrstuvwxyz"
 
 
 class StubProvider(EmbeddingProvider):
+    @property
+    def space(self):
+        return GEMINI_SPACE
+
     def embed_documents(self, texts):
         return [self._vector(t) for t in texts]
 

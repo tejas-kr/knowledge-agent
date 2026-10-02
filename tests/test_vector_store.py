@@ -1,8 +1,10 @@
 import pytest
 
-from knowledge_agent.embeddings.provider import EmbeddingProvider
+from knowledge_agent.embeddings.provider import EmbeddingProvider, EmbeddingQuotaError
+from knowledge_agent.embeddings.space import GEMINI_SPACE, NOMIC_SPACE, EmbeddingSpace
 from knowledge_agent.retrieval.vector_store import (
     DEFAULT_COLLECTION_NAME,
+    EMBEDDING_SPACE_KEY,
     ChromaVectorStore,
     VectorStore,
     VectorStoreError,
@@ -15,9 +17,14 @@ VOCABULARY = "abcdefghijklmnopqrstuvwxyz"
 class StubProvider(EmbeddingProvider):
     """Deterministic bag-of-characters embeddings, so cosine order is meaningful."""
 
-    def __init__(self) -> None:
+    def __init__(self, space: EmbeddingSpace | None = None) -> None:
         self.document_calls: list[list[str]] = []
         self.query_calls: list[str] = []
+        self._space = space if space is not None else GEMINI_SPACE
+
+    @property
+    def space(self) -> EmbeddingSpace:
+        return self._space
 
     def embed_documents(self, texts):
         items = list(texts)
@@ -45,7 +52,13 @@ def make_chunk(content: str, document_id: str = "doc", page_number: int = 1, chu
 
 
 class FakeCollection:
-    def __init__(self, error: Exception | None = None, response: dict | None = None, count=0):
+    def __init__(
+        self,
+        error: Exception | None = None,
+        response: dict | None = None,
+        count=0,
+        metadata: dict | None = None,
+    ):
         self.error = error
         self.response = response or {
             "ids": [["doc:1:0"]],
@@ -62,6 +75,7 @@ class FakeCollection:
         self.upsert_calls: list[dict] = []
         self.query_calls: list[dict] = []
         self.delete_calls: list[dict] = []
+        self.metadata = metadata
 
     def upsert(self, **kwargs):
         if self.error:
@@ -94,6 +108,10 @@ class FakeClient:
 
     def get_or_create_collection(self, **kwargs):
         self.create_calls.append(kwargs)
+
+        if self.collection.metadata is None:
+            self.collection.metadata = kwargs.get("metadata")
+
         return self.collection
 
 
@@ -113,15 +131,15 @@ def test_vector_store_is_abstract():
 
 
 def test_chunk_id_format():
-    assert ChromaVectorStore.chunk_id(make_chunk("x")) == "doc:1:0"
+    assert make_chunk("x").chunk_id == "doc:1:0"
 
 
 def test_chunk_id_distinguishes_pages_and_indexes():
-    assert ChromaVectorStore.chunk_id(make_chunk("x", page_number=7, chunk_index=3)) == "doc:7:3"
+    assert make_chunk("x", page_number=7, chunk_index=3).chunk_id == "doc:7:3"
 
 
 def test_chunk_id_distinguishes_documents():
-    assert ChromaVectorStore.chunk_id(make_chunk("x", document_id="other")) == "other:1:0"
+    assert make_chunk("x", document_id="other").chunk_id == "other:1:0"
 
 
 def test_collection_created_with_cosine_space():
@@ -129,7 +147,118 @@ def test_collection_created_with_cosine_space():
 
     create = store._client.create_calls[0]
     assert create["name"] == DEFAULT_COLLECTION_NAME
-    assert create["metadata"] == {"hnsw:space": "cosine"}
+    assert create["metadata"]["hnsw:space"] == "cosine"
+
+
+def test_collection_records_embedding_space_identity():
+    store = build()
+
+    create = store._client.create_calls[0]
+    assert create["metadata"][EMBEDDING_SPACE_KEY] == "gemini-3072"
+
+
+def test_each_space_owns_its_own_collection():
+    client = FakeClient()
+
+    ChromaVectorStore(StubProvider(NOMIC_SPACE), directory="C:/tmp", client=client)
+
+    create = client.create_calls[0]
+    assert create["name"] == NOMIC_SPACE.collection == "knowledge--nomic-768"
+    assert create["metadata"][EMBEDDING_SPACE_KEY] == "nomic-768"
+
+
+def test_collection_is_selected_from_the_space_without_a_name():
+    store = ChromaVectorStore(space=NOMIC_SPACE, directory="C:/tmp", client=FakeClient())
+
+    assert store.collection_name == "knowledge--nomic-768"
+
+
+def test_a_store_needs_a_provider_or_a_space():
+    with pytest.raises(VectorStoreError, match="provider or space"):
+        ChromaVectorStore(directory="C:/tmp", client=FakeClient())
+
+
+def test_mismatched_embedding_space_is_rejected(tmp_path):
+    collection = FakeCollection(metadata={EMBEDDING_SPACE_KEY: "nomic-768"})
+
+    with pytest.raises(VectorStoreError, match="cannot share an index"):
+        ChromaVectorStore(StubProvider(GEMINI_SPACE), directory=tmp_path, client=FakeClient(collection))
+
+
+def test_mismatch_names_the_space_to_retry(tmp_path):
+    collection = FakeCollection(metadata={EMBEDDING_SPACE_KEY: "nomic-768"})
+
+    with pytest.raises(VectorStoreError, match="--space nomic-768"):
+        ChromaVectorStore(StubProvider(GEMINI_SPACE), directory=tmp_path, client=FakeClient(collection))
+
+
+def test_legacy_collection_without_space_metadata_is_accepted(tmp_path):
+    collection = FakeCollection(metadata={"hnsw:space": "cosine"})
+
+    store = ChromaVectorStore(StubProvider(GEMINI_SPACE), directory=tmp_path, client=FakeClient(collection))
+
+    assert store.collection_name == DEFAULT_COLLECTION_NAME
+
+
+def test_legacy_collection_is_owned_by_gemini_regardless_of_width(tmp_path):
+    collection = FakeCollection(metadata={"hnsw:space": "cosine"})
+
+    with pytest.raises(VectorStoreError, match="cannot share an index"):
+        ChromaVectorStore(
+            StubProvider(NOMIC_SPACE), directory=tmp_path, collection_name="knowledge",
+            client=FakeClient(collection),
+        )
+
+
+def test_legacy_collection_points_at_its_owner(tmp_path):
+    collection = FakeCollection(metadata={"hnsw:space": "cosine"})
+
+    with pytest.raises(VectorStoreError, match="--space gemini-3072"):
+        ChromaVectorStore(
+            StubProvider(NOMIC_SPACE), directory=tmp_path, collection_name="knowledge",
+            client=FakeClient(collection),
+        )
+
+
+def test_an_unrecognised_collection_has_no_owner_to_contradict(tmp_path):
+    collection = FakeCollection(metadata={"hnsw:space": "cosine"})
+
+    store = ChromaVectorStore(
+        StubProvider(NOMIC_SPACE), directory=tmp_path, collection_name="scratch",
+        client=FakeClient(collection),
+    )
+
+    assert store.collection_name == "scratch"
+
+
+def test_counting_does_not_need_a_provider(tmp_path):
+    store = ChromaVectorStore(space=NOMIC_SPACE, directory=tmp_path, client=FakeClient())
+
+    assert store.count() == 0
+
+
+def test_search_without_a_provider_reports_the_gap(tmp_path):
+    store = ChromaVectorStore(
+        space=NOMIC_SPACE,
+        directory=tmp_path,
+        client=FakeClient(FakeCollection(count=3)),
+    )
+
+    with pytest.raises(VectorStoreError, match="No embedding provider"):
+        store.search("question")
+
+
+def test_query_embedding_failure_is_wrapped(tmp_path):
+    class FailingProvider(StubProvider):
+        def embed_query(self, text):
+            raise EmbeddingQuotaError("quota exhausted")
+
+    store = ChromaVectorStore(
+        FailingProvider(), directory=tmp_path, client=FakeClient(FakeCollection(count=3))
+    )
+
+    with pytest.raises(VectorStoreError, match="Failed to embed query"):
+        store.search("question")
 
 
 def test_custom_collection_name_is_used():
@@ -513,3 +642,91 @@ def test_integration_persists_across_instances(tmp_path):
 
     assert reopened.count() == 1
     assert reopened.search("persisted", k=1)[0].content == "persisted text"
+
+
+def test_existing_ids_is_empty_on_a_new_store(tmp_path):
+    store = ChromaVectorStore(
+        provider=StubProvider(), directory=tmp_path / "fresh", collection_name="ids"
+    )
+
+    assert store.existing_ids() == set()
+
+
+def test_existing_ids_reflects_stored_chunks(tmp_path):
+    store = ChromaVectorStore(
+        provider=StubProvider(), directory=tmp_path / "ids", collection_name="ids"
+    )
+
+    store.add_chunks([make_chunk("a", page_number=1), make_chunk("b", page_number=2)])
+
+    assert store.existing_ids() == {"doc:1:0", "doc:2:0"}
+
+
+def test_existing_ids_drops_after_delete(tmp_path):
+    store = ChromaVectorStore(
+        provider=StubProvider(), directory=tmp_path / "ids", collection_name="ids"
+    )
+    store.add_chunks([make_chunk("a", document_id="gone")])
+
+    store.delete_document("gone")
+
+    assert store.existing_ids() == set()
+
+
+def test_embedding_failure_surfaces_as_store_error():
+    from knowledge_agent.embeddings.provider import EmbeddingQuotaError
+
+    class FailingProvider(StubProvider):
+        def embed_documents(self, texts):
+            raise EmbeddingQuotaError("daily cap reached")
+
+    store = build(provider=FailingProvider())
+
+    with pytest.raises(VectorStoreError, match="Failed to embed"):
+        store.add_chunks([make_chunk("a")])
+
+
+def test_embedding_failure_preserves_cause():
+    from knowledge_agent.embeddings.provider import EmbeddingQuotaError
+
+    cause = EmbeddingQuotaError("daily cap reached")
+
+    class FailingProvider(StubProvider):
+        def embed_documents(self, texts):
+            raise cause
+
+    store = build(provider=FailingProvider())
+
+    with pytest.raises(VectorStoreError) as excinfo:
+        store.add_chunks([make_chunk("a")])
+
+    assert excinfo.value.__cause__ is cause
+
+
+def test_empty_add_does_not_call_the_provider():
+    provider = StubProvider()
+    store = build(provider=provider)
+
+    assert store.add_chunks([]) == []
+    assert provider.document_calls == []
+
+
+def test_existing_ids_reads_from_the_collection():
+    class GetCollection(FakeCollection):
+        def get(self, **kwargs):
+            self.get_calls = getattr(self, "get_calls", [])
+            self.get_calls.append(kwargs)
+            return {"ids": ["a:1:0", "b:2:0"]}
+
+    collection = GetCollection()
+    store = build(collection=collection)
+
+    assert store.existing_ids() == {"a:1:0", "b:2:0"}
+    assert collection.get_calls[0]["include"] == []
+
+
+def test_existing_ids_wraps_collection_failures():
+    store = build(collection=FakeCollection(error=RuntimeError("chroma down")))
+
+    with pytest.raises(VectorStoreError, match="Failed to read stored ids"):
+        store.existing_ids()

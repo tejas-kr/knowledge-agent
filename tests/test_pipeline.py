@@ -43,7 +43,7 @@ class FakeStore(VectorStore):
         if self.error is not None:
             raise self.error
 
-        ids = [f"{c.document_id}:{c.page_number}:{c.chunk_index}" for c in items]
+        ids = [c.chunk_id for c in items]
         for chunk_id, chunk in zip(ids, items, strict=True):
             self.records[chunk_id] = chunk
         return ids
@@ -57,6 +57,9 @@ class FakeStore(VectorStore):
 
     def count(self):
         return len(self.records)
+
+    def existing_ids(self):
+        return set(self.records)
 
 
 def make_pdf(path: Path, texts: list[str]) -> Path:
@@ -245,6 +248,89 @@ def test_reindexing_does_not_duplicate_chunks(tmp_path):
     assert second.chunks_indexed == 2
 
 
+def test_resume_skips_already_stored_chunks(tmp_path):
+    make_pdf(tmp_path / "a.pdf", ["alpha", "beta"])
+    store = FakeStore()
+    chunker = RecursiveChunker(chunk_size=100)
+
+    index_directory(tmp_path, store, chunker=chunker)
+    store.add_calls = 0
+
+    resumed = index_directory(tmp_path, store, chunker=chunker, skip_existing=True)
+
+    assert resumed.chunks_indexed == 0
+    assert resumed.chunks_skipped == 2
+    assert store.add_calls == 0
+    assert resumed.total_chunks == 2
+
+
+def test_resume_still_embeds_chunks_that_are_missing(tmp_path):
+    make_pdf(tmp_path / "a.pdf", ["alpha"])
+    store = FakeStore()
+    chunker = RecursiveChunker(chunk_size=100)
+
+    index_directory(tmp_path, store, chunker=chunker)
+
+    make_pdf(tmp_path / "b.pdf", ["beta"])
+
+    resumed = index_directory(tmp_path, store, chunker=chunker, skip_existing=True)
+
+    assert resumed.chunks_skipped == 1
+    assert resumed.chunks_indexed == 1
+    assert resumed.total_chunks == 2
+
+
+def test_resume_is_off_by_default(tmp_path):
+    make_pdf(tmp_path / "a.pdf", ["alpha"])
+    store = FakeStore()
+    chunker = RecursiveChunker(chunk_size=100)
+
+    index_directory(tmp_path, store, chunker=chunker)
+
+    again = index_directory(tmp_path, store, chunker=chunker)
+
+    assert again.chunks_skipped == 0
+    assert again.chunks_indexed == 1
+
+
+def test_resume_against_real_chroma(tmp_path):
+    from knowledge_agent.embeddings.provider import EmbeddingProvider
+    from knowledge_agent.retrieval.vector_store import ChromaVectorStore
+
+    class Provider(EmbeddingProvider):
+        def __init__(self):
+            self.calls = 0
+
+        @property
+        def space(self):
+            from knowledge_agent.embeddings.space import GEMINI_SPACE
+
+            return GEMINI_SPACE
+
+        def embed_documents(self, texts):
+            self.calls += 1
+            return [StubProvider._vector(t) for t in texts]
+
+        def embed_query(self, text):
+            return StubProvider._vector(text)
+
+    make_pdf(tmp_path / "a.pdf", ["alpha", "beta"])
+    provider = Provider()
+    store = ChromaVectorStore(
+        provider=provider, directory=tmp_path / "chroma", collection_name="resume"
+    )
+    chunker = RecursiveChunker(chunk_size=100)
+
+    index_directory(tmp_path, store, chunker=chunker)
+    assert store.existing_ids() == {"a:1:0", "a:2:0"}
+
+    resumed = index_directory(tmp_path, store, chunker=chunker, skip_existing=True)
+
+    assert resumed.chunks_skipped == 2
+    assert resumed.chunks_indexed == 0
+    assert provider.calls == 1
+
+
 def test_index_directory_missing_directory_raises(tmp_path):
     with pytest.raises(DocumentNotFoundError):
         index_directory(tmp_path / "nope", FakeStore())
@@ -260,6 +346,12 @@ def test_index_directory_against_real_chroma(tmp_path):
     from knowledge_agent.retrieval.vector_store import ChromaVectorStore
 
     class Provider(EmbeddingProvider):
+        @property
+        def space(self):
+            from knowledge_agent.embeddings.space import GEMINI_SPACE
+
+            return GEMINI_SPACE
+
         def embed_documents(self, texts):
             return [StubProvider._vector(t) for t in texts]
 
